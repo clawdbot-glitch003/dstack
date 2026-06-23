@@ -32,7 +32,7 @@ use ra_rpc::{
     Attestation,
 };
 use ra_tls::{
-    attestation::QuoteContentType,
+    attestation::{AttestationMode, QuoteContentType},
     cert::{generate_ra_cert, CertConfigV2, CertSigningRequestV2, Csr},
 };
 use rand::Rng as _;
@@ -59,6 +59,7 @@ use dstack_gateway_rpc::{
 use ra_tls::rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use serde_human_bytes as hex_bytes;
 use serde_json::Value;
+use tpm_attest::{self as tpm, TpmContext};
 
 async fn sign_cert_request(
     cert_client: &CertRequestClient,
@@ -84,6 +85,12 @@ async fn sign_cert_request(
 }
 
 mod config_id_verifier;
+
+fn is_unsupported_app_info_quote(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}");
+    message.contains("Unsupported attestation quote")
+        || message.contains("unsupported attestation quote for app info decoding")
+}
 
 #[derive(clap::Parser)]
 /// Prepare full disk encryption
@@ -348,11 +355,11 @@ impl HostShared {
             mkdir -p $host_shared_copy_dir;
             info "Copying host-shared files";
         }?;
-        copy(APP_COMPOSE, SZ_1KB * 256, false)?;
+        copy(APP_COMPOSE, SZ_1MB * 50, false)?;
         copy(SYS_CONFIG, SZ_1KB * 32, false)?;
         copy(INSTANCE_INFO, SZ_1KB * 10, true)?;
         copy(ENCRYPTED_ENV, SZ_1KB * 256, true)?;
-        copy(USER_CONFIG, SZ_1MB, true)?;
+        copy(USER_CONFIG, SZ_1MB * 50, true)?;
         cmd! {
             info "Unmounting host-shared";
             umount $host_shared_dir;
@@ -705,6 +712,46 @@ fn truncate(s: &[u8], len: usize) -> &[u8] {
     }
 }
 
+/// Return a platform-provided, per-instance value to mix into `instance_id`.
+///
+/// `instance_id` is normally derived from `instance_id_seed`, which is persisted
+/// on the data disk. That makes it unsafe on clouds where a VM can be cloned from
+/// a disk image / snapshot: every clone inherits the same seed and therefore the
+/// same `instance_id`. To keep `instance_id` unique per running VM we mix in a
+/// per-instance value that lives outside the cloneable disk.
+///
+/// On GCP we use the public key of the pre-provisioned vTPM Attestation Key. The AK
+/// is derived deterministically from the per-instance Endorsement seed held in the
+/// vTPM (not on the data disk), so a VM cloned from a disk image derives a different
+/// AK while a reboot/stop-start of the same VM keeps it stable — exactly the property
+/// we need. We hash the AK public area rather than its certificate so the binding is
+/// immune to certificate re-issuance (a re-signed cert carries new serial/validity/
+/// signature bytes for the same key).
+///
+/// Returns `Ok(None)` on platforms with no such binding; the `instance_id` then
+/// keeps its previous seed-only derivation. Fails closed: if the platform is known
+/// to provide a binding but it cannot be read, we error rather than silently fall
+/// back to a duplication-prone id.
+fn platform_instance_binding() -> Result<Option<Vec<u8>>> {
+    use dstack_types::Platform;
+    match Platform::detect() {
+        Some(Platform::Gcp) => {
+            // Prefer the ECC AK, fall back to RSA (matches the quote path).
+            let ak = match tpm::load_gcp_ak_ecc(None) {
+                Ok(ak) => ak,
+                Err(ecc_err) => tpm::load_gcp_ak_rsa(None).with_context(|| {
+                    format!("failed to load gcp vTPM AK (ecc error: {ecc_err:#})")
+                })?,
+            };
+            if ak.pub_area.is_empty() {
+                bail!("gcp vTPM AK public area is empty");
+            }
+            Ok(Some(sha256(&ak.pub_area).to_vec()))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn emit_key_provider_info(provider_info: &KeyProviderInfo) -> Result<()> {
     info!("Key provider info: {provider_info:?}");
     let provider_info_json = serde_json::to_vec(&provider_info)?;
@@ -805,6 +852,14 @@ impl<'a> Stage0<'a> {
     }
     fn load(args: &'a SetupArgs) -> Result<Self> {
         let host_shared_copy_dir = args.work_dir.join(HOST_SHARED_DIR_NAME);
+        // dstack-attest and the config-id verifier read host-shared files (e.g.
+        // the SEV mr_config) from this dir. Export it so they don't fall back to
+        // the canonical /dstack/.host-shared, which is only bind-mounted to the
+        // work dir after `dstack-util setup` finishes.
+        std::env::set_var(
+            dstack_types::shared_filenames::HOST_SHARED_DIR_ENV,
+            &host_shared_copy_dir,
+        );
         let host_shared = HostShared::copy("/tmp/.host-shared".as_ref(), &host_shared_copy_dir)?;
         let host_api = HostApi::new(
             host_shared.sys_config.host_api_url.clone(),
@@ -852,11 +907,14 @@ impl<'a> Stage0<'a> {
                     bail!("Invalid server cert usage: {usage}");
                 }
                 if let Some(att) = &cert.attestation {
-                    let kms_info = att
-                        .decode_app_info(false)
-                        .context("Failed to decode app_info")?;
-                    emit_runtime_event("mr-kms", &kms_info.mr_aggregated)
-                        .context("Failed to extend mr-kms to RTMR3")?;
+                    match att.decode_app_info(false) {
+                        Ok(kms_info) => emit_runtime_event("mr-kms", &kms_info.mr_aggregated)
+                            .context("Failed to extend mr-kms to RTMR3")?,
+                        Err(err) if is_unsupported_app_info_quote(&err) => {
+                            warn!("Skipping mr-kms runtime event for unsupported attestation quote: {err:#}");
+                        }
+                        Err(err) => return Err(err).context("Failed to decode app_info"),
+                    }
                 }
                 Ok(())
             }))
@@ -955,6 +1013,41 @@ impl<'a> Stage0<'a> {
         Ok(app_keys)
     }
 
+    fn generate_tpm_app_keys(&self) -> Result<AppKeys> {
+        let tpm = TpmContext::detect().context("failed to detect TPM context")?;
+
+        // Get PCR policy for sealing (boot chain + app PCR)
+        let pcr_policy = tpm::dstack_pcr_policy();
+
+        // Try to read sealed seed (bound to PCR values including app PCR)
+        if let Some(seed) = tpm
+            .unseal::<32>(tpm::SEALED_NV_INDEX, tpm::PRIMARY_KEY_HANDLE, &pcr_policy)
+            .context("failed to unseal from TPM")?
+        {
+            info!(
+                "unsealed root key seed from TPM (PCR policy: {})",
+                pcr_policy.to_arg()
+            );
+            return gen_app_keys_from_seed(&seed, KeyProviderKind::Tpm, None)
+                .context("failed to generate TPM app keys");
+        }
+
+        // No sealed seed exists, generate new one
+        info!("no sealed seed found, generating new seed...");
+        let seed: [u8; 32] = tpm.get_random().context("TPM RNG unavailable")?;
+        // Seal the new seed to TPM with PCR policy (including app PCR)
+        tpm.seal(
+            &seed,
+            tpm::SEALED_NV_INDEX,
+            tpm::PRIMARY_KEY_HANDLE,
+            &pcr_policy,
+        )
+        .context("failed to seal seed to TPM")?;
+
+        gen_app_keys_from_seed(&seed, KeyProviderKind::Tpm, None)
+            .context("failed to generate TPM app keys")
+    }
+
     async fn request_app_keys(&self) -> Result<AppKeys> {
         let key_provider = self.shared.app_compose.key_provider();
         match key_provider {
@@ -967,7 +1060,8 @@ impl<'a> Stage0<'a> {
                     .context("Failed to generate app keys")
             }
             KeyProviderKind::Tpm => {
-                bail!("Tpm key provider is not supported");
+                info!("Generating app keys from TPM");
+                self.generate_tpm_app_keys()
             }
         }
     }
@@ -1298,9 +1392,11 @@ impl<'a> Stage0<'a> {
     fn measure_app_info(&self) -> Result<AppInfo> {
         let compose_hash = sha256_file(self.shared.dir.app_compose_file())?;
         let truncated_compose_hash = truncate(&compose_hash, 20);
-        let kms_enabled = self.shared.app_compose.kms_enabled();
         let key_provider = self.shared.app_compose.key_provider();
         let mut instance_info = self.shared.instance_info.clone();
+        let is_snp = AttestationMode::detect()
+            .map(|mode| mode == AttestationMode::DstackAmdSevSnp)
+            .unwrap_or(false);
 
         if instance_info.app_id.is_empty() {
             instance_info.app_id = truncated_compose_hash.to_vec();
@@ -1313,7 +1409,7 @@ impl<'a> Stage0<'a> {
         }
 
         let disk_reusable = !key_provider.is_none();
-        if (!disk_reusable) || instance_info.instance_id_seed.is_empty() {
+        if ((!disk_reusable) && !is_snp) || instance_info.instance_id_seed.is_empty() {
             instance_info.instance_id_seed = {
                 let mut rand_id = vec![0u8; 20];
                 getrandom::fill(&mut rand_id)?;
@@ -1325,17 +1421,25 @@ impl<'a> Stage0<'a> {
         } else {
             let mut id_path = instance_info.instance_id_seed.clone();
             id_path.extend_from_slice(&instance_info.app_id);
+            if !is_snp {
+                if let Some(binding) = platform_instance_binding()? {
+                    info!("mixing platform per-instance binding into instance_id");
+                    id_path.extend_from_slice(&binding);
+                }
+            }
             sha256(&id_path)[..20].to_vec()
         };
         instance_info.instance_id = instance_id.clone();
-        let app_id = if kms_enabled {
-            instance_info.app_id.clone()
-        } else {
-            truncated_compose_hash.to_vec()
-        };
+        // app_id is the deploy-time instance_info.app_id (which defaults to the
+        // truncated compose hash when unset, see above). Previously the non-KMS
+        // path forced the compose-derived value; now a deployment may pin an
+        // explicit app_id even without a KMS. The app_id is measured into RTMR3
+        // (emit_runtime_event below), so a verifier sees exactly this value — with
+        // no KMS to bind it, the relying party MUST gate the compose_hash
+        // (which launcher build) separately from the app_id (which app).
 
         emit_runtime_event("system-preparing", &[])?;
-        emit_runtime_event("app-id", &app_id)?;
+        emit_runtime_event("app-id", &instance_info.app_id)?;
         emit_runtime_event("compose-hash", &compose_hash)?;
         emit_runtime_event("instance-id", &instance_id)?;
         emit_runtime_event("boot-mr-done", &[])?;
@@ -1355,6 +1459,7 @@ impl<'a> Stage0<'a> {
                 .try_into()
                 .ok()
                 .context("Invalid app id")?,
+            &app_info.instance_info.instance_id,
             keys.key_provider.kind(),
             keys.key_provider.id(),
         )?;
@@ -1364,8 +1469,8 @@ impl<'a> Stage0<'a> {
             KeyProvider::Local { mr, .. } => {
                 KeyProviderInfo::new("local-sgx".into(), hex::encode(mr))
             }
-            KeyProvider::Tpm { .. } => {
-                bail!("Tpm key provider is not supported");
+            KeyProvider::Tpm { pubkey, .. } => {
+                KeyProviderInfo::new("tpm".into(), hex::encode(pubkey))
             }
             KeyProvider::Kms { pubkey, .. } => {
                 KeyProviderInfo::new("kms".into(), hex::encode(pubkey))

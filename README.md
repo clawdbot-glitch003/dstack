@@ -20,11 +20,20 @@ Original Contributors: Hang Yin, Kevin Wang, Andrew Miller
 
 ## What is dstack?
 
-dstack is the open framework for confidential AI - deploy AI applications with cryptographic privacy guarantees.
+dstack is the open framework for confidential AI — deploy AI applications with cryptographic privacy guarantees.
 
 AI providers ask users to trust them with sensitive data. But trust doesn't scale, and trust can't be verified. With dstack, your containers run inside confidential VMs (Intel TDX) with native support for NVIDIA Confidential Computing (H100, Blackwell). Users can cryptographically verify exactly what's running: private AI with your existing Docker workflow.
 
-### Features
+## Supported Platforms
+
+| Platform | Status | Attestation |
+|----------|--------|-------------|
+| **Bare metal TDX** | Available | TDX |
+| **[Phala Cloud](https://cloud.phala.network)** | Available | TDX |
+| **GCP Confidential VMs** | Available | TDX + TPM |
+| **AWS Nitro Enclaves** | Available | NSM |
+
+## Features
 
 **Zero friction onboarding**
 - **Docker Compose native**: Bring your docker-compose.yaml as-is. No SDK, no code changes.
@@ -57,9 +66,9 @@ services:
       - "8000:8000"
 ```
 
-Deploy to any TDX host with the [`dstack-nvidia-0.5.x` base image](https://github.com/Dstack-TEE/meta-dstack/releases), or use [Phala Cloud](https://cloud.phala.network) for managed infrastructure.
+Deploy to any Intel TDX host using a guest OS image from [meta-dstack releases](https://github.com/Dstack-TEE/meta-dstack/releases), or use [Phala Cloud](https://cloud.phala.network) for managed infrastructure.
 
-Want to deploy a self hosted dstack? Check our [full deployment guide →](./docs/deployment.md)
+Setting up dstack on your own hardware? See the [full deployment guide →](./docs/deployment.md)
 
 ## Architecture
 
@@ -187,6 +196,8 @@ dstack is a Linux Foundation [Confidential Computing Consortium](https://confide
 
 [Telegram](https://t.me/+UO4bS4jflr45YmUx) · [GitHub Discussions](https://github.com/Dstack-TEE/dstack/discussions) · [Examples](https://github.com/Dstack-TEE/dstack-examples)
 
+For enterprise support and licensing, [book a call](https://cal.com/team/phala/founders) or email us at support@phala.network.
+
 [![Repobeats](https://repobeats.axiom.co/api/embed/0a001cc3c1f387fae08172a9e116b0ec367b8971.svg)](https://github.com/Dstack-TEE/dstack/pulse)
 
 ## Cite
@@ -209,3 +220,5 @@ Logo and branding assets: [dstack-logo-kit](./docs/assets/dstack-logo-kit/)
 ## License
 
 Apache 2.0
+</content>
+</invoke>

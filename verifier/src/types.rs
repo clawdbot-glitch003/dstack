@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use dstack_types::KeyProviderInfo;
 use ra_tls::attestation::AppInfo;
 use serde::{Deserialize, Serialize};
 
@@ -9,12 +10,15 @@ use serde_human_bytes as serde_bytes;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationRequest {
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "serde_bytes", default)]
     pub quote: Option<Vec<u8>>,
+    #[serde(default)]
     pub event_log: Option<String>,
+    #[serde(default)]
     pub vm_config: Option<String>,
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "serde_bytes", default)]
     pub attestation: Option<Vec<u8>>,
+    #[serde(default)]
     pub debug: Option<bool>,
 }
 
@@ -37,9 +41,17 @@ pub struct VerificationDetails {
     /// event log payloads.
     pub event_log_verified: bool,
     pub os_image_hash_verified: bool,
+    /// dev vs prod OS image, from metadata.json (bound to os_image_hash). None if not exposed.
+    pub os_image_is_dev: Option<bool>,
+    /// dstack OS version, from the same metadata.json.
+    pub os_image_version: Option<String>,
+    /// "tdx" | "gcp-tdx" | "nitro".
+    pub tee_platform: Option<String>,
     pub report_data: Option<String>,
     pub tcb_status: Option<String>,
     pub advisory_ids: Vec<String>,
+    /// decoded app_info.key_provider_info; name is e.g. "kms" or "local".
+    pub key_provider: Option<KeyProviderInfo>,
     pub app_info: Option<AppInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acpi_tables: Option<AcpiTables>,
@@ -83,4 +95,42 @@ pub enum RtmrEventStatus {
     Mismatch,
     Extra,
     Missing,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // the README documents sending either `attestation` or
+    // (`quote` + `event_log` + `vm_config`); every field is optional, so any
+    // documented subset must deserialize without a "missing field" error.
+
+    #[test]
+    fn deserializes_quote_subset_without_attestation() {
+        let json = r#"{"quote":"00","event_log":"[]","vm_config":"{}"}"#;
+        let req: VerificationRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.quote, Some(vec![0u8]));
+        assert_eq!(req.event_log.as_deref(), Some("[]"));
+        assert_eq!(req.vm_config.as_deref(), Some("{}"));
+        assert_eq!(req.attestation, None);
+        assert_eq!(req.debug, None);
+    }
+
+    #[test]
+    fn deserializes_attestation_subset_without_quote() {
+        let json = r#"{"attestation":"00"}"#;
+        let req: VerificationRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.attestation, Some(vec![0u8]));
+        assert_eq!(req.quote, None);
+        assert_eq!(req.event_log, None);
+        assert_eq!(req.vm_config, None);
+    }
+
+    #[test]
+    fn deserializes_empty_object() {
+        let req: VerificationRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(req.quote, None);
+        assert_eq!(req.attestation, None);
+        assert_eq!(req.debug, None);
+    }
 }

@@ -12,8 +12,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use cc_eventlog::TdxEvent;
 use dstack_mr::{RtmrLog, TdxMeasurementDetails, TdxMeasurements};
 use dstack_types::VmConfig;
+use hex_literal::hex;
 use ra_tls::attestation::{
-    Attestation, AttestationQuote, VerifiedAttestation, VersionedAttestation,
+    Attestation, AttestationQuote, DstackVerifiedReport, NitroPcrs, TpmQuote, VerifiedAttestation,
+    VersionedAttestation,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -24,6 +26,23 @@ use crate::types::{
     AcpiTables, RtmrEventEntry, RtmrEventStatus, RtmrMismatch, VerificationDetails,
     VerificationRequest, VerificationResponse,
 };
+
+fn tee_platform_name(quote: &AttestationQuote) -> &'static str {
+    match quote {
+        AttestationQuote::DstackTdx(_) => "tdx",
+        AttestationQuote::DstackGcpTdx(_) => "gcp-tdx",
+        AttestationQuote::DstackNitroEnclave(_) => "nitro",
+        AttestationQuote::DstackAmdSevSnp(_) => "sev-snp",
+    }
+}
+
+/// best-effort: None for empty/malformed blobs.
+fn decode_key_provider_info(bytes: &[u8]) -> Option<dstack_types::KeyProviderInfo> {
+    if bytes.is_empty() {
+        return None;
+    }
+    serde_json::from_slice(bytes).ok()
+}
 
 fn collect_rtmr_mismatch(
     rtmr_label: &str,
@@ -134,6 +153,8 @@ struct ImagePaths {
     kernel_path: PathBuf,
     initrd_path: PathBuf,
     kernel_cmdline: String,
+    is_dev: bool,
+    version: String,
 }
 
 pub struct CvmVerifier {
@@ -374,6 +395,8 @@ impl CvmVerifier {
             kernel_path,
             initrd_path,
             kernel_cmdline,
+            is_dev: image_info.is_dev,
+            version: image_info.version,
         })
     }
 
@@ -411,23 +434,14 @@ impl CvmVerifier {
         } else {
             bail!("Quote is required");
         };
-        let mut details = VerificationDetails {
-            quote_verified: false,
-            event_log_verified: false,
-            os_image_hash_verified: false,
-            report_data: None,
-            tcb_status: None,
-            advisory_ids: vec![],
-            app_info: None,
-            acpi_tables: None,
-            rtmr_debug: None,
-        };
+        let mut details = VerificationDetails::default();
 
         let debug = request.debug.unwrap_or(false);
         let verified = attestation.into_v1().verify(self.pccs_url.as_deref()).await;
         let verified_attestation = match verified {
             Ok(att) => {
                 details.quote_verified = true;
+                details.tee_platform = Some(tee_platform_name(&att.quote).to_string());
                 details.tcb_status = att.report.tdx_report().map(|r| r.status.clone());
                 details.advisory_ids = att
                     .report
@@ -469,6 +483,7 @@ impl CvmVerifier {
             Ok(mut info) => {
                 info.os_image_hash = vm_config.os_image_hash;
                 details.event_log_verified = true;
+                details.key_provider = decode_key_provider_info(&info.key_provider_info);
                 details.app_info = Some(info);
             }
             Err(e) => {
@@ -494,22 +509,77 @@ impl CvmVerifier {
         debug: bool,
         details: &mut VerificationDetails,
     ) -> Result<VmConfig> {
-        let vm_config = attestation
+        // The raw config string used for platform-specific binding: the explicit
+        // request `vm_config` when supplied, otherwise the one embedded in the
+        // attestation (mirroring `decode_vm_config`'s own fallback).
+        let raw_config = if vm_config.is_empty() {
+            attestation.config.clone()
+        } else {
+            vm_config.clone()
+        };
+        let mut vm_config = attestation
             .decode_vm_config(&vm_config)
             .context("Failed to decode VM config")?;
         match &attestation.quote {
+            AttestationQuote::DstackGcpTdx(quote) => {
+                self.verify_os_image_hash_for_gcp_tdx(&vm_config, &quote.tpm_quote)
+                    .await?;
+            }
             AttestationQuote::DstackTdx(_) => {
                 self.verify_os_image_hash_for_dstack_tdx(&vm_config, attestation, debug, details)
                     .await?;
             }
-            AttestationQuote::DstackGcpTdx | AttestationQuote::DstackNitroEnclave => {
-                bail!(
-                    "Unsupported attestation quote: {:?}",
-                    attestation.quote.mode()
-                );
+            AttestationQuote::DstackNitroEnclave(_) => {
+                let DstackVerifiedReport::DstackNitroEnclave(report) = &attestation.report else {
+                    bail!("internal error: nitro quote without a verified nitro report");
+                };
+                self.verify_os_image_hash_for_nitro_enclave(&vm_config, &report.pcrs)?;
+            }
+            AttestationQuote::DstackAmdSevSnp(_) => {
+                self.verify_os_image_hash_for_dstack_sev(
+                    attestation,
+                    &raw_config,
+                    &mut vm_config,
+                    details,
+                )?;
             }
         }
         Ok(vm_config)
+    }
+
+    /// Verify the AMD SEV-SNP OS image binding.
+    ///
+    /// Unlike TDX (which replays RTMRs against a downloaded image), the SNP boot
+    /// is summarised by the launch `MEASUREMENT`. The CVM advertises the
+    /// self-contained launch inputs (`sev_snp_measurement`) and the MrConfigV3
+    /// document in its `vm_config`; we recompute the launch measurement from
+    /// those inputs and require it to equal the hardware-signed `MEASUREMENT`
+    /// (which is what makes the otherwise-untrusted inputs trustworthy), require
+    /// `HOST_DATA` to bind the MrConfigV3 document, and then derive the
+    /// image-invariant `os_image_hash`. The shared recomputation in
+    /// `dstack_mr::sev` is the same code path the KMS uses for key release, so a
+    /// quote that the KMS would release keys for verifies here too.
+    fn verify_os_image_hash_for_dstack_sev(
+        &self,
+        attestation: &VerifiedAttestation,
+        raw_config: &str,
+        vm_config: &mut VmConfig,
+        details: &mut VerificationDetails,
+    ) -> Result<()> {
+        let report = attestation
+            .report
+            .amd_snp_report()
+            .context("internal error: sev-snp quote without a verified sev-snp report")?;
+        let binding =
+            dstack_mr::sev::verify_sev_launch(&report.measurement, &report.host_data, raw_config)
+                .context("amd sev-snp launch verification failed")?;
+        // The os_image_hash derived from the measurement-bound launch inputs is
+        // the authoritative one; surface it (overriding any guest-advertised
+        // value, which is not independently trusted).
+        vm_config.os_image_hash = binding.os_image_hash;
+        details.tcb_status = Some(report.tcb_info.tcb_status().to_string());
+        details.advisory_ids = report.advisory_ids.clone();
+        Ok(())
     }
 
     async fn verify_os_image_hash_for_dstack_tdx(
@@ -540,11 +610,16 @@ impl CvmVerifier {
             rtmr2: report.rt_mr2.to_vec(),
         };
 
-        // Compute expected measurements (reusing the public API)
+        // one download serves both measurement computation and the dev/version flags
+        let image_paths = self.ensure_image_downloaded(vm_config).await?;
+        details.os_image_is_dev = Some(image_paths.is_dev);
+        if !image_paths.version.is_empty() {
+            details.os_image_version = Some(image_paths.version.clone());
+        }
+
+        // Compute expected measurements
         let (mrs, expected_logs) = if debug {
             // For debug mode, we need detailed logs and ACPI tables
-            let image_paths = self.ensure_image_downloaded(vm_config).await?;
-
             let TdxMeasurementDetails {
                 measurements,
                 rtmr_logs,
@@ -567,11 +642,16 @@ impl CvmVerifier {
 
             (measurements, Some(rtmr_logs))
         } else {
-            // For non-debug mode, reuse the public API with caching
+            // For non-debug mode, use the cached-measurement path.
             (
-                self.compute_measurements_for_config(vm_config)
-                    .await
-                    .context("Failed to compute expected measurements")?,
+                self.load_or_compute_measurements(
+                    vm_config,
+                    &image_paths.fw_path,
+                    &image_paths.kernel_path,
+                    &image_paths.initrd_path,
+                    &image_paths.kernel_cmdline,
+                )
+                .context("Failed to compute expected measurements")?,
                 None,
             )
         };
@@ -635,6 +715,85 @@ impl CvmVerifier {
                 result
             }
         }
+    }
+
+    /// Verify Nitro Enclave OS image hash using the signature-verified NSM PCRs.
+    ///
+    /// For Nitro:
+    /// 1. PCR0/1/2 come from the EIF build (code + kernel + app) in production mode.
+    /// 2. In debug mode AWS zeroes PCR0/1/2, so there is no measurement of the
+    ///    actual code; we refuse to authorize such enclaves.
+    /// 3. The computed image hash is compared against vm_config.os_image_hash.
+    fn verify_os_image_hash_for_nitro_enclave(
+        &self,
+        vm_config: &VmConfig,
+        pcrs: &NitroPcrs,
+    ) -> Result<()> {
+        // Reject debug-mode enclaves outright: their zeroed PCRs measure nothing,
+        // so accepting them would let arbitrary code run under attestation.
+        if pcrs.is_debug() {
+            bail!("nitro enclave is in debug mode (PCR0/1/2 are zeroed); refusing to verify");
+        }
+        let os_image_hash = pcrs.image_hash();
+        // Compare with expected os_image_hash from vm_config
+        if os_image_hash != vm_config.os_image_hash {
+            bail!(
+                "os_image_hash mismatch: expected={}, computed={}",
+                hex::encode(&vm_config.os_image_hash),
+                hex::encode(&os_image_hash)
+            );
+        }
+        Ok(())
+    }
+
+    async fn verify_os_image_hash_for_gcp_tdx(
+        &self,
+        vm_config: &VmConfig,
+        tpm_quote: &TpmQuote,
+    ) -> Result<()> {
+        // Verify PCR 0 (GCP OVMF firmware)
+        const EXPECTED_PCR0: [u8; 32] =
+            hex!("0cca9ec161b09288802e5a112255d21340ed5b797f5fe29cecccfd8f67b9f802");
+
+        let pcr0 = tpm_quote
+            .pcr_values
+            .iter()
+            .find(|p| p.index == 0)
+            .context("PCR 0 not found in TPM quote")?;
+
+        // Get expected UKI hash from os_image_hash (which should be set to UKI Authenticode hash)
+        let expected_uki_hash = &vm_config.os_image_hash;
+
+        let pcr2_events: Vec<_> = tpm_quote
+            .event_log
+            .iter()
+            .filter(|e| e.pcr_index == 2)
+            .collect();
+        debug!("PCR 2 Event Log contains {} events", pcr2_events.len());
+        // Extract Event 28 (3rd event, 0-indexed as 2)
+        // NOTE: This is GCP OVMF-specific behavior
+        let event_28_digest = {
+            if pcr0.value != EXPECTED_PCR0 {
+                bail!(
+                    "PCR 0 mismatch: expected GCP OVMF v2, got {}",
+                    hex::encode(&pcr0.value)
+                );
+            }
+            &pcr2_events.get(2).context("Event 28 not found")?.digest
+        };
+
+        if event_28_digest != expected_uki_hash {
+            bail!(
+                "UKI hash mismatch: expected={}, actual={}",
+                hex::encode(expected_uki_hash),
+                hex::encode(event_28_digest)
+            );
+        }
+        debug!(
+            "✓ UKI hash verified from PCR 2 Event Log (Event 28), digest: {}",
+            hex::encode(event_28_digest)
+        );
+        Ok(())
     }
 
     pub async fn download_image(&self, hex_os_image_hash: &str, dst_dir: &Path) -> Result<()> {
@@ -798,5 +957,22 @@ impl Mrs {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_key_provider_info_parses_json_and_tolerates_garbage() {
+        let info =
+            decode_key_provider_info(br#"{"name":"kms","id":"abcd"}"#).expect("should parse");
+        assert_eq!(info.name, "kms");
+        assert_eq!(info.id, "abcd");
+
+        // empty/malformed must degrade to None, not fail the verify.
+        assert!(decode_key_provider_info(b"").is_none());
+        assert!(decode_key_provider_info(b"not json").is_none());
     }
 }

@@ -23,12 +23,16 @@ path = [
     "**/tsconfig.node.json",
     "**/tsconfig.browser.json",
     "kms/auth-eth-bun/.oxlintrc.json",
+    "kms/auth-eth/slither.config.json",
     "package-lock.json",
     "**/package-lock.json",
     "kms/auth-eth/.openzeppelin/unknown-2035.json",
     "kms/auth-mock/.oxlintrc.json",
     "kms/auth-simple/.oxlintrc.json",
     "kms/auth-simple/auth-config.example.json",
+    "tools/sca/examples/heartbeat/config.json",
+    "tools/sca/examples/hello-c/config.json",
+    "tools/sca/examples/heartbeat/rootfs/etc/heartbeat/interval",
     "sdk/simulator/*.json",
     "sdk/go/go.sum",
     "sdk/go/ratls/go.sum",
@@ -72,6 +76,18 @@ path = [
     "sdk/simulator/attestation.bin",
     "ra-tls/assets/tdx_quote",
     "cc-eventlog/samples/ccel.bin",
+    "cc-eventlog/samples/tpm_eventlog.bin",
+    "tpm-attest/tests/tpm_quote_sample.bin",
+    "tpm-qvl/certs/gcp-root-ca.pem",
+    "dstack-attest/tests/nitro_attestation.bin",
+    "dstack-attest/tests/nitro_attestation_dbg.bin",
+    "dstack-attest/tests/sev_snp_attestation.bin",
+    "dstack-attest/tests/sev_snp_ask.pem",
+    "dstack-attest/tests/sev_snp_vcek.pem",
+    "nsm-attest/tests/nitro_attestation.bin",
+    "nsm-qvl/tests/nitro_attestation.bin",
+    "nsm-qvl/certs/AWS_NitroEnclaves_Root-G1.pem",
+    "tpm-qvl/certs/AWS_NitroEnclaves_Root-G1.pem",
 ]
 SPDX-FileCopyrightText = "NONE"
 SPDX-License-Identifier = "CC0-1.0"
@@ -115,11 +131,6 @@ path = "kms/auth-eth/lib/forge-std/**"
 SPDX-FileCopyrightText = "NONE"
 SPDX-License-Identifier = "Apache-2.0"
 precedence = "override"
-
-[[annotations]]
-path = "mod-tdx-guest/Kconfig"
-SPDX-FileCopyrightText = "© 2022 Intel Corporation"
-SPDX-License-Identifier = "GPL-2.0-only"
 
 # Generated files
 

@@ -21,12 +21,19 @@ hex.workspace = true
 hex_fmt.workspace = true
 or-panic.workspace = true
 scale = { workspace = true, features = ["derive"] }
+sev-snp-attest.workspace = true
+sev-snp-qvl.workspace = true
 serde.workspace = true
 serde-human-bytes.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sha3.workspace = true
 tdx-attest.workspace = true
+tpm-attest.workspace = true
+nsm-attest.workspace = true
+nsm-qvl.workspace = true
+tpm-qvl.workspace = true
+tpm-types.workspace = true
 tracing.workspace = true
 insta.workspace = true
 errify.workspace = true
@@ -37,3 +44,4 @@ quote = []
 [dev-dependencies]
 futures = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+dstack-mr = { workspace = true }

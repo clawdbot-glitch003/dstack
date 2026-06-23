@@ -4,7 +4,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use cc_eventlog::{RuntimeEvent, TdxEvent};
+use dstack_types::mr_config::MrConfigV3;
 use serde::{Deserialize, Serialize};
+use tpm_types::TpmQuote;
 
 pub const ATTESTATION_VERSION: u64 = 1;
 
@@ -17,24 +19,76 @@ pub enum PlatformEvidence {
         event_log: Vec<TdxEvent>,
     },
     #[serde(rename = "gcp-tdx")]
-    GcpTdx,
+    GcpTdx {
+        quote: Vec<u8>,
+        event_log: Vec<TdxEvent>,
+        tpm_quote: TpmQuote,
+    },
     #[serde(rename = "nitro-enclave")]
-    NitroEnclave,
+    NitroEnclave { nsm_quote: Vec<u8> },
+    #[serde(rename = "sev-snp")]
+    SevSnp {
+        report: Vec<u8>,
+        cert_chain: Vec<Vec<u8>>,
+        mr_config: String,
+    },
 }
 
 impl PlatformEvidence {
     pub fn tdx_quote(&self) -> Option<&[u8]> {
         match self {
-            Self::Tdx { quote, .. } => Some(quote.as_slice()),
+            Self::Tdx { quote, .. } | Self::GcpTdx { quote, .. } => Some(quote.as_slice()),
             _ => None,
         }
     }
 
     pub fn tdx_event_log(&self) -> Option<&[TdxEvent]> {
         match self {
-            Self::Tdx { event_log, .. } => Some(event_log.as_slice()),
+            Self::Tdx { event_log, .. } | Self::GcpTdx { event_log, .. } => {
+                Some(event_log.as_slice())
+            }
             _ => None,
         }
+    }
+
+    pub fn tpm_quote(&self) -> Option<&TpmQuote> {
+        match self {
+            Self::GcpTdx { tpm_quote, .. } => Some(tpm_quote),
+            _ => None,
+        }
+    }
+
+    pub fn nsm_quote(&self) -> Option<&[u8]> {
+        match self {
+            Self::NitroEnclave { nsm_quote } => Some(nsm_quote.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn sev_snp_report(&self) -> Option<&[u8]> {
+        match self {
+            Self::SevSnp { report, .. } => Some(report.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn sev_snp_cert_chain(&self) -> Option<&[Vec<u8>]> {
+        match self {
+            Self::SevSnp { cert_chain, .. } => Some(cert_chain.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn sev_snp_mr_config_document(&self) -> Option<&str> {
+        match self {
+            Self::SevSnp { mr_config, .. } => Some(mr_config.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn sev_snp_mr_config(&self) -> Option<MrConfigV3> {
+        self.sev_snp_mr_config_document()
+            .and_then(|document| MrConfigV3::from_document(document).ok())
     }
 
     pub fn into_stripped(self) -> Self {
@@ -46,6 +100,19 @@ impl PlatformEvidence {
                     .filter(|event| event.imr == 3)
                     .map(|event| event.stripped())
                     .collect(),
+            },
+            Self::GcpTdx {
+                quote,
+                event_log,
+                tpm_quote,
+            } => Self::GcpTdx {
+                quote,
+                event_log: event_log
+                    .into_iter()
+                    .filter(|event| event.imr == 3)
+                    .map(|event| event.stripped())
+                    .collect(),
+                tpm_quote,
             },
             other => other,
         }
@@ -192,7 +259,7 @@ impl Attestation {
 
     /// Return a new attestation with the report_data patched in both platform quote and stack.
     pub fn with_report_data(self, report_data: [u8; 64]) -> Self {
-        use crate::attestation::TDX_QUOTE_REPORT_DATA_RANGE;
+        use crate::attestation::{SNP_REPORT_DATA_RANGE, TDX_QUOTE_REPORT_DATA_RANGE};
 
         let platform = match self.platform {
             PlatformEvidence::Tdx {
@@ -203,6 +270,20 @@ impl Attestation {
                     quote[TDX_QUOTE_REPORT_DATA_RANGE].copy_from_slice(&report_data);
                 }
                 PlatformEvidence::Tdx { quote, event_log }
+            }
+            PlatformEvidence::SevSnp {
+                mut report,
+                cert_chain,
+                mr_config,
+            } => {
+                if report.len() >= SNP_REPORT_DATA_RANGE.end {
+                    report[SNP_REPORT_DATA_RANGE].copy_from_slice(&report_data);
+                }
+                PlatformEvidence::SevSnp {
+                    report,
+                    cert_chain,
+                    mr_config,
+                }
             }
             other => other,
         };
@@ -239,6 +320,17 @@ impl Attestation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_mr_config_document() -> String {
+        MrConfigV3::new(
+            vec![0x11; 20],
+            vec![0x22; 32],
+            dstack_types::KeyProviderKind::None,
+            Vec::new(),
+            vec![0x33; 20],
+        )
+        .to_canonical_json()
+    }
 
     #[test]
     fn msgpack_roundtrip_preserves_attestation() {
@@ -293,5 +385,58 @@ mod tests {
             }
             _ => panic!("expected dstack-pod stack evidence"),
         }
+    }
+
+    #[test]
+    fn sev_snp_msgpack_roundtrip_preserves_evidence() {
+        let attestation = Attestation::new(
+            PlatformEvidence::SevSnp {
+                report: vec![0x11; 1184],
+                cert_chain: vec![vec![0x22, 0x33]],
+                mr_config: test_mr_config_document(),
+            },
+            StackEvidence::Dstack {
+                report_data: vec![9u8; 64],
+                runtime_events: vec![],
+                config: "{}".into(),
+            },
+        );
+
+        let encoded = attestation.to_msgpack().expect("encode msgpack");
+        let decoded = Attestation::from_msgpack(&encoded).expect("decode msgpack");
+        assert_eq!(
+            decoded.platform.sev_snp_report(),
+            Some(vec![0x11; 1184].as_slice())
+        );
+        assert_eq!(
+            decoded.platform.sev_snp_cert_chain(),
+            Some(vec![vec![0x22, 0x33]].as_slice())
+        );
+    }
+
+    #[test]
+    fn sev_snp_with_report_data_patches_report_and_stack() {
+        let mut report = vec![0x11; 1184];
+        report[crate::attestation::SNP_REPORT_DATA_RANGE].copy_from_slice(&[0x22; 64]);
+        let attestation = Attestation::new(
+            PlatformEvidence::SevSnp {
+                report,
+                cert_chain: vec![],
+                mr_config: test_mr_config_document(),
+            },
+            StackEvidence::Dstack {
+                report_data: vec![0x22; 64],
+                runtime_events: vec![],
+                config: "{}".into(),
+            },
+        );
+
+        let patched = attestation.with_report_data([0x33; 64]);
+        assert_eq!(patched.report_data().unwrap(), [0x33; 64]);
+        let report = patched.platform.sev_snp_report().unwrap();
+        assert_eq!(
+            &report[crate::attestation::SNP_REPORT_DATA_RANGE],
+            &[0x33; 64]
+        );
     }
 }
